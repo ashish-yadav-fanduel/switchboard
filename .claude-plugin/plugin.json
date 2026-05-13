@@ -1,0 +1,6 @@
+{
+  "name": "switchboard",
+  "version": "1.0.0",
+  "description": "Prompt compressor for Claude Code. Strips filler words, scores sentences with TF-IDF, and shows a daily token-savings dashboard. Routes prompts to haiku/sonnet/opus via LiteLLM complexity scoring.",
+  "hooks": "../hooks/hooks.json"
+}

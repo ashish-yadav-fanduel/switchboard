@@ -1,0 +1,14 @@
+{
+  "UserPromptSubmit": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "\"${CLAUDE_PLUGIN_ROOT}/run.sh\"",
+          "timeout": 15,
+          "statusMessage": "Compressing prompt…"
+        }
+      ]
+    }
+  ]
+}

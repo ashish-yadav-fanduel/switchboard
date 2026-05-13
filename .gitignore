@@ -1,0 +1,35 @@
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Runtime / local state (daemon + stats)
+daemon.pid
+daily_stats.json
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Hugging Face / model caches (optional; uncomment if you prefer not to track cache paths)
+# .cache/
