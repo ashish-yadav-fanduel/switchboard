@@ -343,6 +343,11 @@ def run_hook() -> None:
     prompt: str = data.get("prompt", "")
     token_estimate = len(prompt) // 4
 
+    # TERM_PROGRAM is set by actual terminal emulators (iTerm2, Terminal.app, etc.)
+    # and is absent when Claude Code desktop spawns the hook subprocess.
+    # TERM alone is unreliable — it's often inherited by the desktop app's env.
+    is_terminal = bool(os.environ.get("TERM_PROGRAM"))
+
     if token_estimate < MIN_TOKENS:
         sys.stdout.write("{}")
         return
@@ -365,69 +370,120 @@ def run_hook() -> None:
     stats["original_tokens"] += token_estimate
     _save_stats(stats)
 
+    daily_total = f"{stats['tokens_saved']:,} [{stats['compressions']}×]"
     hint = _model_hint(compressed, compressed_tokens)
-    advisory = f"[switchboard/{source}] {ratio:.1f}× compressed"
+
+    # One-line badge shown to the user via Claude's response
+    badge = f"`⚡ switchboard` · {source} · {ratio:.1f}× · {savings_pct}% saved · {daily_total} today"
     if hint:
-        advisory += f" · {hint}"
-    advisory += f"\n{BREVITY_CONTEXT}"
+        badge += f" · {hint}"
+
+    advisory = (
+        f"[switchboard/{source}] {ratio:.1f}× compressed · {savings_pct}% saved\n"
+        f"Start your response with this exact line (no extra text before it):\n{badge}\n\n"
+        + BREVITY_CONTEXT
+    )
+
+    # Desktop app: show a native macOS notification
+    if not is_terminal:
+        subtitle = hint.strip() if hint else source
+        body = f"{ratio:.1f}× compressed · {savings_pct}% saved · {stats['tokens_saved']:,} tokens today"
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 f'display notification "{body}" with title "Switchboard" subtitle "{subtitle}"'],
+                timeout=2, check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
 
     preview_limit = 400
     preview = compressed[:preview_limit] + ("…" if len(compressed) > preview_limit else "")
 
-    # ── ANSI helpers ──
-    BOLD   = "\033[1m"
-    GREEN  = "\033[32m"
-    CYAN   = "\033[36m"
-    YELLOW = "\033[33m"
-    DIM    = "\033[2m"
-    RESET  = "\033[0m"
-    WHITE  = "\033[97m"
-
-    # ── ASCII bar chart (caveman-style) ──
-    BAR_W = 10
-    def bar(pct: float) -> str:
-        filled = round(min(pct, 100) / 100 * BAR_W)
-        return "█" * filled + "░" * (BAR_W - filled)
-
-    filler_pct = min(filler_count * 12, 100)
+    filler_pct  = min(filler_count * 12, 100)
     engine_pct  = 100 if source == "llmlingua" else 55
 
-    daily_total = f"{stats['tokens_saved']:,} [{stats['compressions']}×]"
-    rows = [
-        ("TOKENS SAVED",   bar(savings_pct),  f"{savings_pct}%  ({daily_total} today)"),
-        ("COMPRESSION",    bar(min((ratio-1)/2*100, 100)), f"{ratio:.1f}×"),
-        ("FILLER REMOVED", bar(filler_pct),   f"{filler_count} phrases"),
-        ("ENGINE",         bar(engine_pct),   source),
+    # Build the stats block. stderr output from hooks is shown inline in the
+    # Claude Code chat transcript (both terminal and desktop app), so write
+    # there for the in-chat display. systemMessage is kept as a fallback.
+    if is_terminal:
+        # ANSI chart for terminal
+        BOLD   = "\033[1m"
+        GREEN  = "\033[32m"
+        CYAN   = "\033[36m"
+        YELLOW = "\033[33m"
+        DIM    = "\033[2m"
+        RESET  = "\033[0m"
+        WHITE  = "\033[97m"
+
+        BAR_W = 10
+        def bar(pct: float) -> str:
+            filled = round(min(pct, 100) / 100 * BAR_W)
+            return "█" * filled + "░" * (BAR_W - filled)
+
+        rows = [
+            ("TOKENS SAVED",   bar(savings_pct),  f"{savings_pct}%  ({daily_total} today)"),
+            ("COMPRESSION",    bar(min((ratio-1)/2*100, 100)), f"{ratio:.1f}×"),
+            ("FILLER REMOVED", bar(filler_pct),   f"{filler_count} phrases"),
+            ("ENGINE",         bar(engine_pct),   source),
+        ]
+        if hint:
+            rows.append(("MODEL HINT", bar(80), hint))
+
+        label_w = max(len(r[0]) for r in rows)
+        val_w   = max(len(r[2]) for r in rows)
+        border  = "─" * (label_w + 2 + BAR_W + 2 + val_w + 2)
+
+        lines = [f"{BOLD}{WHITE}┌{border}┐{RESET}"]
+        for label, b, val in rows:
+            lines.append(
+                f"{BOLD}{WHITE}│{RESET} "
+                f"{CYAN}{label:<{label_w}}{RESET}  "
+                f"{YELLOW}{b}{RESET}  "
+                f"{BOLD}{GREEN}{val:<{val_w}}{RESET} "
+                f"{BOLD}{WHITE}│{RESET}"
+            )
+        lines.append(f"{BOLD}{WHITE}└{border}┘{RESET}")
+        lines.append(f"\n{BOLD}Prompt sent to Claude:{RESET}\n{DIM}{preview}{RESET}")
+        sys.stderr.write("\n".join(lines) + "\n")
+    else:
+        # Plain text for desktop app — shown as hook output block in the chat
+        lines = [
+            f"Switchboard · {source} · {ratio:.1f}× compressed",
+            f"  Tokens saved   {savings_pct}%  ({daily_total} today)",
+            f"  Compression    {ratio:.1f}×",
+            f"  Filler removed {filler_count} phrases",
+            f"  Engine         {source}",
+        ]
+        if hint:
+            lines.append(f"  Model hint     {hint}")
+        lines.append(f"\nPrompt: {preview}")
+        sys.stderr.write("\n".join(lines) + "\n")
+
+    md_rows = [
+        ("Tokens saved",   f"{savings_pct}%  ({daily_total} today)"),
+        ("Compression",    f"{ratio:.1f}×"),
+        ("Filler removed", f"{filler_count} phrases"),
+        ("Engine",         source),
     ]
     if hint:
-        rows.append(("MODEL HINT", bar(80), hint))
-
-    label_w = max(len(r[0]) for r in rows)
-    val_w   = max(len(r[2]) for r in rows)
-    inner_w = label_w + 2 + BAR_W + 2 + val_w
-    border  = f"{'─' * (inner_w + 2)}"
-
-    chart_lines = [f"{BOLD}{WHITE}┌{border}┐{RESET}"]
-    for label, b, val in rows:
-        chart_lines.append(
-            f"{BOLD}{WHITE}│{RESET} "
-            f"{CYAN}{label:<{label_w}}{RESET}  "
-            f"{YELLOW}{b}{RESET}  "
-            f"{BOLD}{GREEN}{val:<{val_w}}{RESET} "
-            f"{BOLD}{WHITE}│{RESET}"
-        )
-    chart_lines.append(f"{BOLD}{WHITE}└{border}┘{RESET}")
-
+        md_rows.append(("Model hint", hint))
+    table = "| | |\n|---|---|\n"
+    table += "\n".join(f"| **{label}** | {val} |" for label, val in md_rows)
     system_msg = (
-        "\n".join(chart_lines)
-        + f"\n\n{BOLD}Prompt sent to Claude:{RESET}\n{DIM}{preview}{RESET}"
+        f"**Switchboard** · {source} · {ratio:.1f}× compressed\n\n"
+        + table
+        + f"\n\n**Prompt sent to Claude:**\n*{preview}*"
     )
 
-    sys.stdout.write(json.dumps({
-        "userMessage": compressed,
-        "additionalContext": advisory,
-        "systemMessage": system_msg,
-    }))
+    # Only include userMessage when text actually changed — when it equals the
+    # original Claude Code treats the hook as a no-op and skips systemMessage.
+    out: dict = {"additionalContext": advisory, "systemMessage": system_msg}
+    if compressed != prompt:
+        out["userMessage"] = compressed
+
+    sys.stdout.write(json.dumps(out))
 
 
 # ── Daemon mode ───────────────────────────────────────────────────────────────
