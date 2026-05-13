@@ -53,9 +53,11 @@ To distribute from GitHub, users add to `~/.claude/settings.json` (replace `your
 
 ```json
 {
-  "extraKnownMarketplaces": [
-    { "source": "github", "repo": "your-gh-username/switchboard" }
-  ],
+  "extraKnownMarketplaces": {
+    "switchboard": {
+      "source": { "source": "github", "repo": "your-gh-username/switchboard" }
+    }
+  },
   "enabledPlugins": { "switchboard@switchboard": true }
 }
 ```

@@ -9,8 +9,12 @@ SETTINGS="$HOME/.claude/settings.json"
 echo "==> Creating virtual environment..."
 python3 -m venv "$VENV_DIR"
 
-echo "==> Installing LLMLingua..."
-"$VENV_DIR/bin/pip" install --quiet llmlingua
+echo "==> Installing dependencies..."
+"$VENV_DIR/bin/pip" install --quiet litellm
+if [[ "${INSTALL_LLMLINGUA:-0}" == "1" ]]; then
+    echo "==> Installing LLMLingua (optional, ~180MB)..."
+    "$VENV_DIR/bin/pip" install --quiet llmlingua || echo "    LLMLingua install failed — heuristic compressor will be used."
+fi
 
 echo "==> Registering hook in $SETTINGS..."
 python3 - <<PYEOF
