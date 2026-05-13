@@ -341,6 +341,7 @@ def run_hook() -> None:
         return
 
     prompt: str = data.get("prompt", "")
+    is_plan_mode: bool = data.get("permission_mode") == "plan"
     token_estimate = len(prompt) // 4
 
     # TERM_PROGRAM is set by actual terminal emulators (iTerm2, Terminal.app, etc.)
@@ -384,8 +385,9 @@ def run_hook() -> None:
         + BREVITY_CONTEXT
     )
 
-    # Desktop app: show a native macOS notification
-    if not is_terminal:
+    # Desktop app: show a macOS notification only in plan mode
+    # (normal mode uses the additionalContext badge via Claude's response instead)
+    if not is_terminal and is_plan_mode:
         subtitle = hint.strip() if hint else source
         body = f"{ratio:.1f}× compressed · {savings_pct}% saved · {stats['tokens_saved']:,} tokens today"
         try:
