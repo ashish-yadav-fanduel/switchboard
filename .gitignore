@@ -16,8 +16,10 @@ build/
 *.egg
 
 # Runtime / local state (daemon + stats)
-daemon.pid
+*.pid
+*.db
 daily_stats.json
+torchinductor_*/
 
 # Environment and secrets
 .env

@@ -11,8 +11,8 @@
         "source": "github",
         "repo": "ashish-yadav-fanduel/switchboard"
       },
-      "description": "Prompt compressor for Claude Code. Strips filler words, scores sentences with TF-IDF, and shows a daily token-savings dashboard. Routes prompts to haiku/sonnet/opus via LiteLLM complexity scoring.",
-      "version": "1.0.0"
+      "description": "Switchboard v2: local prompt compression, output brevity modes (/sb-lite/full/ultra), USD token-savings dashboard, model nudge (Haiku→Opus routing), org rollup, and universal GenAI proxy (OpenAI + Anthropic SDK drop-in). One daemon shared across Claude Code, Cursor, and ChatGPT.",
+      "version": "2.0.0"
     }
   ]
 }

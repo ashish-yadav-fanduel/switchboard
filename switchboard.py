@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Switchboard — local Claude Code prompt compressor.
+Switchboard v2 — Claude Code adapter.
 
-Hook mode (default):  called by Claude Code on every UserPromptSubmit.
-Daemon mode (--serve): persistent process that holds LLMLingua in memory.
+Hook mode (default):  called by Claude Code on every UserPromptSubmit / SessionStart / Stop.
+Daemon mode (--serve): persistent process that holds all state and compression logic.
 
-The hook starts the daemon on first use and keeps it alive between prompts
-so the 180MB model only loads once per session.
+The hook starts the daemon on first use and communicates via HTTP on localhost:PORT.
+All compression, classification, stats, and brevity logic lives in the daemon/ package.
 """
 
 import json
@@ -14,158 +14,33 @@ import os
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
+import urllib.error
 from pathlib import Path
 
 HOOK_DIR    = Path(os.environ.get(
     "SWITCHBOARD_DATA",
-    Path.home() / "Desktop" / "development" / "switchboard",
+    Path.home() / ".claude" / "hooks" / "switchboard",
 ))
 PID_FILE    = HOOK_DIR / "daemon.pid"
-STATS_FILE  = HOOK_DIR / "daily_stats.json"
-PORT        = 9847
-MIN_TOKENS  = 10      # skip compression for short prompts
-MIN_RATIO   = 1.0     # don't show advisory if savings are negligible
-WAIT_SECS   = 5.0     # max time to wait for daemon to start
-REQ_TIMEOUT = 3.0     # max time for a compress request
-IDLE_SECS   = 7200    # daemon shuts itself down after 2h idle
+PORT        = int(os.environ.get("SWITCHBOARD_PORT", 9847))
 
-# Brevity instruction injected into Claude's context (caveman-style output compression)
-BREVITY_CONTEXT = (
-    "[brevity mode] Respond concisely. Use fragments where meaning is clear. "
-    "Skip filler, hedging phrases, and explanatory padding. "
-    "Prefer: [thing] [action] [outcome]. Omit 'please note', 'it is worth', 'basically', 'just'."
-)
-
-# ── Daily stats ───────────────────────────────────────────────────────────────
-
-def _load_stats() -> dict:
-    from datetime import date
-    today = str(date.today())
-    try:
-        data = json.loads(STATS_FILE.read_text())
-        if data.get("date") == today:
-            return data
-    except Exception:
-        pass
-    return {"date": today, "tokens_saved": 0, "compressions": 0, "original_tokens": 0}
-
-
-def _save_stats(stats: dict) -> None:
-    try:
-        STATS_FILE.write_text(json.dumps(stats))
-    except Exception:
-        pass
-
-
-# ── Model routing ─────────────────────────────────────────────────────────────
-
-_complexity_router = None  # lazy-loaded, reused across calls in same process
-
-
-def _model_hint(text: str, compressed_tokens: int) -> str:
-    """
-    Uses LiteLLM ComplexityRouter (7-dimension local scoring, no API calls).
-    Extended with Claude Code-specific reasoning/technical keywords and
-    rebalanced weights so architectural prompts score correctly.
-    Falls back to keyword heuristics if litellm is unavailable.
-    """
-    global _complexity_router
-    try:
-        import logging
-        os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "1")
-
-        from litellm.router_strategy.complexity_router.complexity_router import (
-            ComplexityRouter, ComplexityTier,
-        )
-        from litellm.router_strategy.complexity_router.config import (
-            ComplexityRouterConfig,
-            DEFAULT_TECHNICAL_KEYWORDS,
-            DEFAULT_REASONING_KEYWORDS,
-            DEFAULT_CODE_KEYWORDS,
-            DEFAULT_SIMPLE_KEYWORDS,
-        )
-        from litellm._logging import verbose_router_logger
-        verbose_router_logger.setLevel(logging.ERROR)
-
-        if _complexity_router is None:
-            _complexity_router = ComplexityRouter(
-                model_name="dummy",
-                litellm_router_instance=None,
-                complexity_router_config={
-                    "reasoning_keywords": DEFAULT_REASONING_KEYWORDS + [
-                        "trade-off", "trade-offs", "trade off", "trade offs",
-                        "tradeoff", "tradeoffs",
-                        "when should", "best approach", "how should i approach",
-                        "how should i", "should i use", "which is better",
-                        "what's the difference", "compare", "architect",
-                        "design pattern", "best practice", "pros and cons",
-                    ],
-                    "technical_keywords": DEFAULT_TECHNICAL_KEYWORDS + [
-                        "cqrs", "event sourcing", "event-driven", "multi-tenant",
-                        "row-level security", "dependency injection", "solid",
-                        "domain-driven", "ddd", "hexagonal", "clean architecture",
-                        "saga", "outbox", "circuit breaker", "rate limiting",
-                        "idempotent", "eventual consistency", "sharding",
-                        "consistency model", "cap theorem", "acid", "base",
-                    ],
-                    "dimension_weights": {
-                        "tokenCount":        0.10,
-                        "codePresence":      0.20,
-                        "reasoningMarkers":  0.30,
-                        "technicalTerms":    0.30,
-                        "simpleIndicators":  0.05,
-                        "multiStepPatterns": 0.03,
-                        "questionComplexity":0.02,
-                    },
-                    "tier_boundaries": {
-                        "simple_medium":    0.10,
-                        "medium_complex":   0.28,
-                        "complex_reasoning":0.55,
-                    },
-                },
-            )
-
-        tier, score, signals = _complexity_router.classify(text)
-
-        label = {
-            ComplexityTier.SIMPLE:    f"→ haiku    (score {score:.2f})",
-            ComplexityTier.MEDIUM:    f"→ sonnet   (score {score:.2f})",
-            ComplexityTier.COMPLEX:   f"→ sonnet   (score {score:.2f})",
-            ComplexityTier.REASONING: f"→ opus     (score {score:.2f})",
-        }.get(tier, f"→ sonnet (score {score:.2f})")
-        return label
-    except Exception:
-        pass
-
-    # Keyword fallback
-    lower = text.lower()
-    keyword_map = [
-        (["unit test", "pytest", "spec", "mock", "fixture", "assert"],        "→ haiku"),
-        (["explain", "summarize", "tldr", "what does", "what is", "describe"],"→ haiku"),
-        (["refactor", "rename", "clean up", "add type hints", "lint"],         "→ sonnet"),
-        (["architect", "design system", "how should i approach", "trade-off"], "→ opus"),
-        (["debug", "why is this", "root cause", "not working", "investigate"],  None),
-    ]
-    for signals, hint in keyword_map:
-        if any(s in lower for s in signals):
-            if hint:
-                return hint
-            return "→ opus" if compressed_tokens > 800 else "→ sonnet"
-    return "→ opus" if compressed_tokens > 800 else ""
+MIN_TOKENS  = 10    # skip very short prompts
+MIN_RATIO   = 1.05  # skip if compression savings are negligible
+WAIT_SECS   = 8.0   # daemon starts in <1s without llmlingua; allow headroom
+REQ_TIMEOUT = 4.0
 
 
 # ── Daemon communication ──────────────────────────────────────────────────────
 
-def _post(path: str, body: dict | None = None, timeout: float = REQ_TIMEOUT) -> dict | None:
+def _call(path: str, body: dict | None = None, timeout: float = REQ_TIMEOUT) -> dict | None:
     try:
-        data = json.dumps(body or {}).encode() if body else None
-        req = urllib.request.Request(
+        data = json.dumps(body).encode() if body is not None else None
+        req  = urllib.request.Request(
             f"http://localhost:{PORT}{path}",
             data=data,
             headers={"Content-Type": "application/json"} if data else {},
-            method="POST" if data else "GET",
+            method="POST" if data is not None else "GET",
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
@@ -173,165 +48,108 @@ def _post(path: str, body: dict | None = None, timeout: float = REQ_TIMEOUT) -> 
         return None
 
 
-def _start_daemon() -> None:
+def _ensure_daemon() -> bool:
+    if _call("/health", timeout=0.5) is not None:
+        return True
     subprocess.Popen(
         [sys.executable, str(Path(__file__).resolve()), "--serve"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
+        env={**os.environ, "SWITCHBOARD_DATA": str(HOOK_DIR)},
     )
-
-
-def _wait_for_daemon(timeout: float) -> bool:
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + WAIT_SECS
     while time.monotonic() < deadline:
-        if _post("/health", timeout=0.5) is not None:
+        if _call("/health", timeout=0.5) is not None:
             return True
-        time.sleep(0.3)
+        time.sleep(0.25)
     return False
 
 
-import re as _re
+# ── Local fallbacks (when daemon unavailable) ─────────────────────────────────
 
-# ── Caveman-style filler patterns (word-level) ────────────────────────────────
-_FILLER_RE = _re.compile(
-    r'\b('
-    r'please note that|it is worth noting that|it should be noted that|'
-    r'as you can see|needless to say|'
-    r'just|really|basically|sure|actually|honestly|certainly|'
-    r'of course|you know|i mean|in other words|that being said|'
-    r'at the end of the day|for what it\'s worth|to be honest|'
-    r'it\'s important to|feel free to'
-    r')\s*',
-    _re.IGNORECASE,
-)
-
-
-def _strip_filler(text: str) -> tuple[str, int]:
-    """Remove hedging/filler phrases while preserving code blocks.
-    Returns (cleaned_text, filler_count)."""
-    CODE_RE = _re.compile(r'(```[\s\S]*?```|`[^`\n]+`)', _re.MULTILINE)
-    parts = CODE_RE.split(text)
-    result = []
-    total_removed = 0
-    for i, part in enumerate(parts):
-        if i % 2 == 1:  # code block — leave untouched
-            result.append(part)
-            continue
-        cleaned, n = _FILLER_RE.subn('', part)
-        total_removed += n
-        cleaned = _re.sub(r'([.!?])\s+,\s*', r'\1 ', cleaned)
-        cleaned = _re.sub(r'(?m)^\s*[,;]\s*', '', cleaned)
-        cleaned = _re.sub(r'[ \t]{2,}', ' ', cleaned)
-        cleaned = _re.sub(r'(?<=[.!?] )([a-z])', lambda m: m.group(1).upper(), cleaned)
-        result.append(cleaned)
-    return '\n'.join(p for p in result if p.strip()), total_removed
-
-
-def _heuristic_compress(text: str, target_ratio: float = 0.5) -> tuple[str, float, int]:
-    """
-    Two-pass compressor (caveman-inspired):
-      1. Word-level: strip filler/hedging phrases
-      2. Sentence-level: TF-IDF scoring, drop lowest-information sentences
-    Preserves code blocks throughout. Keeps first/last sentence as anchors.
-    Returns (compressed_text, actual_ratio, filler_count).
-    """
-    import math
-    import re
-    from collections import Counter
-
-    text, filler_count = _strip_filler(text)
-
-    CODE_RE = re.compile(r'(```[\s\S]*?```)', re.MULTILINE)
-
-    # Stash code blocks so they're never scored or dropped
-    placeholders: dict[str, str] = {}
-    ph_counter = [0]
-
-    def stash(m: re.Match) -> str:
-        key = f"\x00BLK{ph_counter[0]}\x00"
-        placeholders[key] = m.group(0)
-        ph_counter[0] += 1
-        return key
-
-    scrubbed = CODE_RE.sub(stash, text)
-
-    # Split into sentences on ./?/! followed by whitespace, or on blank lines
-    raw_sentences = re.split(r'(?<=[.!?])\s+|\n{2,}', scrubbed)
-    sentences = [s.strip() for s in raw_sentences if s.strip()]
-
-    if len(sentences) <= 3:
-        return text, 1.0, filler_count
-
-    # TF-IDF scoring
-    def tokens(s: str) -> list[str]:
-        return re.findall(r'[a-z]+', s.lower())
-
-    tokenized = [tokens(s) for s in sentences]
-    doc_freq = Counter(t for toks in tokenized for t in set(toks))
-    n = len(sentences)
-
-    def score(toks: list[str]) -> float:
-        if not toks:
-            return 0.0
-        tf = Counter(toks)
-        return sum(
-            (tf[t] / len(toks)) * math.log((n + 1) / (doc_freq[t] + 1))
-            for t in tf
-        ) / len(tf)
-
-    scores = [score(t) for t in tokenized]
-
-    # Always keep first + last sentence as context anchors
-    must_keep = {0, len(sentences) - 1}
-
-    original_chars = sum(len(s) for s in sentences)
-    target_chars = max(int(original_chars * target_ratio), 1)
-
-    # Greedily fill budget in score order (must-keep go first)
-    order = sorted(range(len(sentences)),
-                   key=lambda i: (0 if i in must_keep else 1, -scores[i]))
-    kept: set[int] = set()
-    total = 0
-    for i in order:
-        if total >= target_chars and i not in must_keep:
-            break
-        kept.add(i)
-        total += len(sentences[i])
-
-    compressed_parts = [s for i, s in enumerate(sentences) if i in kept]
-    compressed = " ".join(compressed_parts)
-
-    # Restore code blocks
-    for key, block in placeholders.items():
-        compressed = compressed.replace(key, block)
-
-    actual_ratio = len(text) / max(len(compressed), 1)
-    return compressed, round(actual_ratio, 2), filler_count
-
-
-def _compress(text: str) -> tuple[str, float, str, int]:
-    """
-    Returns (compressed_text, ratio, source, filler_count).
-    Tries LLMLingua daemon first, falls back to heuristic.
-    Always succeeds.
-    """
-    result = _post("/compress", {"text": text, "ratio": 0.5})
-    if result:
-        return result["compressed"], result["ratio"], "llmlingua", 0
-
-    # Daemon not running — try to start it (for future requests)
-    _start_daemon()
-    if _wait_for_daemon(WAIT_SECS):
-        result = _post("/compress", {"text": text, "ratio": 0.5})
-        if result:
-            return result["compressed"], result["ratio"], "llmlingua", 0
-
-    compressed, ratio, filler_count = _heuristic_compress(text)
+def _local_compress(text: str) -> tuple[str, float, str, int]:
+    """Pure-local heuristic compression — no daemon required."""
+    sys.path.insert(0, str(Path(__file__).parent))
+    from daemon.compress import heuristic_compress
+    compressed, ratio, filler_count = heuristic_compress(text)
     return compressed, ratio, "heuristic", filler_count
 
 
-# ── Hook mode ─────────────────────────────────────────────────────────────────
+def _local_brevity_text() -> str:
+    try:
+        from daemon.brevity import get_text, DEFAULT_MODE
+        return get_text(DEFAULT_MODE)
+    except Exception:
+        return (
+            "[brevity mode] Respond concisely. Skip filler and hedging. "
+            "Prefer [thing] [action] [outcome]."
+        )
+
+
+# ── Session ID ────────────────────────────────────────────────────────────────
+
+def _session_id() -> str:
+    """Date-scoped session ID — one session per local calendar day."""
+    from datetime import date
+    return str(date.today())
+
+
+def _macos_notify(hint: str, ratio: float, savings_pct: int, daily_total: str) -> None:
+    """Fire a macOS notification. Uses osascript; falls back to terminal-notifier if available."""
+    import platform
+
+    def _ascii(s: str) -> str:
+        return s.encode("ascii", "ignore").decode()
+
+    subtitle = _ascii(hint[:50])
+    body_msg  = _ascii(f"{ratio:.1f}x · {savings_pct}% saved · {daily_total} today")
+
+    try:
+        ver = platform.mac_ver()[0]
+        major = int(ver.split(".")[0]) if ver else 0
+        _debug_log(f"notify: macOS={ver} major={major}")
+    except Exception as e:
+        _debug_log(f"notify: ver_check_err={e}")
+        major = 0
+
+    # Try osascript first (broken on some macOS 26 builds but worth trying)
+    try:
+        result = subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{body_msg}" with title "Switchboard" subtitle "{subtitle}"'],
+            timeout=2, check=False, capture_output=True, text=True,
+        )
+        _debug_log(f"notify: osascript rc={result.returncode} err={result.stderr.strip()!r}")
+        if result.returncode == 0:
+            return
+    except Exception as e:
+        _debug_log(f"notify: osascript_exc={e}")
+
+    # Fallback: terminal-notifier (brew install terminal-notifier)
+    try:
+        result = subprocess.run(
+            ["terminal-notifier", "-title", "Switchboard", "-subtitle", subtitle,
+             "-message", body_msg, "-sound", "default"],
+            timeout=2, check=False, capture_output=True, text=True,
+        )
+        _debug_log(f"notify: terminal-notifier rc={result.returncode}")
+    except FileNotFoundError:
+        _debug_log("notify: terminal-notifier not found — brew install terminal-notifier")
+    except Exception as e:
+        _debug_log(f"notify: terminal-notifier_exc={e}")
+
+
+# ── Hook: UserPromptSubmit ────────────────────────────────────────────────────
+
+def _debug_log(msg: str) -> None:
+    try:
+        log = HOOK_DIR / "hook_invoke.log"
+        with open(log, "a") as f:
+            f.write(f"{msg}\n")
+    except Exception:
+        pass
+
 
 def run_hook() -> None:
     try:
@@ -340,231 +158,203 @@ def run_hook() -> None:
         sys.stdout.write("{}")
         return
 
-    prompt: str = data.get("prompt", "")
-    is_plan_mode: bool = data.get("permission_mode") == "plan"
-    token_estimate = len(prompt) // 4
+    prompt: str        = data.get("prompt", "")
+    is_plan: bool      = data.get("permission_mode") == "plan"
+    is_terminal: bool  = bool(os.environ.get("TERM_PROGRAM"))
+    token_estimate     = len(prompt) // 4
+    session_id         = _session_id()
 
-    # TERM_PROGRAM is set by actual terminal emulators (iTerm2, Terminal.app, etc.)
-    # and is absent when Claude Code desktop spawns the hook subprocess.
-    # TERM alone is unreliable — it's often inherited by the desktop app's env.
-    is_terminal = bool(os.environ.get("TERM_PROGRAM"))
+    _debug_log(
+        f"invoked tokens={token_estimate} terminal={is_terminal} plan={is_plan} "
+        f"TERM={os.environ.get('TERM','?')} TERM_PROGRAM={os.environ.get('TERM_PROGRAM','?')}"
+    )
 
     if token_estimate < MIN_TOKENS:
         sys.stdout.write("{}")
         return
 
-    stats = _load_stats()
+    # ── Compression ────────────────────────────────────────────────────────────
+    daemon_ok = _ensure_daemon()
+    _debug_log(f"daemon_ok={daemon_ok}")
 
-    compressed, ratio, source, filler_count = _compress(prompt)
+    if daemon_ok:
+        result = _call("/compress", {"text": prompt, "ratio": 0.5})
+    else:
+        result = None
 
+    if result:
+        compressed    = result["compressed"]
+        ratio         = result["ratio"]
+        source        = result["source"]
+        filler_count  = result.get("filler_count", 0)
+    else:
+        compressed, ratio, source, filler_count = _local_compress(prompt)
+
+    _debug_log(f"ratio={ratio:.2f} source={source}")
     if ratio < MIN_RATIO:
+        _debug_log("skipped: ratio below threshold")
         sys.stdout.write("{}")
         return
 
     compressed_tokens = max(int(token_estimate / ratio), 1)
-    tokens_saved = token_estimate - compressed_tokens
-    savings_pct = round(tokens_saved / max(token_estimate, 1) * 100)
+    tokens_saved      = token_estimate - compressed_tokens
+    savings_pct       = round(tokens_saved / max(token_estimate, 1) * 100)
 
-    # update and persist daily stats
-    stats["tokens_saved"]   += tokens_saved
-    stats["compressions"]   += 1
-    stats["original_tokens"] += token_estimate
-    _save_stats(stats)
+    # ── Classification + model nudge ───────────────────────────────────────────
+    hint_label  = ""
+    tier        = "MEDIUM"
+    recommended = ""
+    if daemon_ok:
+        cls = _call("/classify", {"text": compressed, "tokens": compressed_tokens})
+        if cls:
+            tier        = cls.get("tier", "MEDIUM")
+            hint_label  = cls.get("hint_label", "")   # non-empty only above $0.005 threshold
+            recommended = cls.get("recommended", "")
 
-    daily_total = f"{stats['tokens_saved']:,} [{stats['compressions']}×]"
-    hint = _model_hint(compressed, compressed_tokens)
+    # ── USD savings on input compression ──────────────────────────────────────
+    try:
+        from daemon.pricing import usd_for_tokens
+        usd_saved = usd_for_tokens(tokens_saved)
+    except Exception:
+        usd_saved = 0.0
 
-    # One-line badge shown to the user via Claude's response
-    badge = f"`⚡ switchboard` · {source} · {ratio:.1f}× · {savings_pct}% saved · {daily_total} today"
-    if hint:
-        badge += f" · {hint}"
-
-    advisory = (
-        f"[switchboard/{source}] {ratio:.1f}× compressed · {savings_pct}% saved\n"
-        f"Start your response with this exact line (no extra text before it):\n{badge}\n\n"
-        + BREVITY_CONTEXT
-    )
-
-    # Desktop app: show a macOS notification only in plan mode
-    # (normal mode uses the additionalContext badge via Claude's response instead)
-    if not is_terminal and is_plan_mode:
-        subtitle = hint.strip() if hint else source
-        body = f"{ratio:.1f}× compressed · {savings_pct}% saved · {stats['tokens_saved']:,} tokens today"
-        try:
-            subprocess.run(
-                ["osascript", "-e",
-                 f'display notification "{body}" with title "Switchboard" subtitle "{subtitle}"'],
-                timeout=2, check=False,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            pass
-
-    preview_limit = 400
-    preview = compressed[:preview_limit] + ("…" if len(compressed) > preview_limit else "")
-
-    filler_pct  = min(filler_count * 12, 100)
-    engine_pct  = 100 if source == "llmlingua" else 55
-
-    # Build the stats block. stderr output from hooks is shown inline in the
-    # Claude Code chat transcript (both terminal and desktop app), so write
-    # there for the in-chat display. systemMessage is kept as a fallback.
-    if is_terminal:
-        # ANSI chart for terminal
-        BOLD   = "\033[1m"
-        GREEN  = "\033[32m"
-        CYAN   = "\033[36m"
-        YELLOW = "\033[33m"
-        DIM    = "\033[2m"
-        RESET  = "\033[0m"
-        WHITE  = "\033[97m"
-
-        BAR_W = 10
-        def bar(pct: float) -> str:
-            filled = round(min(pct, 100) / 100 * BAR_W)
-            return "█" * filled + "░" * (BAR_W - filled)
-
-        rows = [
-            ("TOKENS SAVED",   bar(savings_pct),  f"{savings_pct}%  ({daily_total} today)"),
-            ("COMPRESSION",    bar(min((ratio-1)/2*100, 100)), f"{ratio:.1f}×"),
-            ("FILLER REMOVED", bar(filler_pct),   f"{filler_count} phrases"),
-            ("ENGINE",         bar(engine_pct),   source),
-        ]
-        if hint:
-            rows.append(("MODEL HINT", bar(80), hint))
-
-        label_w = max(len(r[0]) for r in rows)
-        val_w   = max(len(r[2]) for r in rows)
-        border  = "─" * (label_w + 2 + BAR_W + 2 + val_w + 2)
-
-        lines = [f"{BOLD}{WHITE}┌{border}┐{RESET}"]
-        for label, b, val in rows:
-            lines.append(
-                f"{BOLD}{WHITE}│{RESET} "
-                f"{CYAN}{label:<{label_w}}{RESET}  "
-                f"{YELLOW}{b}{RESET}  "
-                f"{BOLD}{GREEN}{val:<{val_w}}{RESET} "
-                f"{BOLD}{WHITE}│{RESET}"
-            )
-        lines.append(f"{BOLD}{WHITE}└{border}┘{RESET}")
-        lines.append(f"\n{BOLD}Prompt sent to Claude:{RESET}\n{DIM}{preview}{RESET}")
-        sys.stderr.write("\n".join(lines) + "\n")
+    # ── Brevity mode ───────────────────────────────────────────────────────────
+    if daemon_ok:
+        brev = _call("/brevity", timeout=1.0)
+        brevity_text = brev.get("text", _local_brevity_text()) if brev else _local_brevity_text()
+        brevity_mode = brev.get("mode", "full") if brev else "full"
     else:
-        # Plain text for desktop app — shown as hook output block in the chat
-        lines = [
-            f"Switchboard · {source} · {ratio:.1f}× compressed",
-            f"  Tokens saved   {savings_pct}%  ({daily_total} today)",
-            f"  Compression    {ratio:.1f}×",
-            f"  Filler removed {filler_count} phrases",
-            f"  Engine         {source}",
-        ]
-        if hint:
-            lines.append(f"  Model hint     {hint}")
-        lines.append(f"\nPrompt: {preview}")
-        sys.stderr.write("\n".join(lines) + "\n")
+        brevity_text = _local_brevity_text()
+        brevity_mode = "full"
 
-    md_rows = [
+    # ── Persist event ──────────────────────────────────────────────────────────
+    if daemon_ok:
+        _call("/event", {
+            "session_id":   session_id,
+            "event_type":   "compress",
+            "tokens_in":    token_estimate,
+            "tokens_saved": tokens_saved,
+            "ratio":        ratio,
+            "source":       source,
+            "tier":         tier,
+            "model_hint":   hint_label[:80],
+            "usd_saved":    usd_saved,
+            "brevity_mode": brevity_mode,
+        })
+
+    # ── Load stats for display ─────────────────────────────────────────────────
+    daily_usd = 0.0
+    if daemon_ok:
+        stats_data = _call("/stats", timeout=1.0)
+        if stats_data:
+            daily_saved = stats_data["session"]["tokens_saved"]
+            daily_count = stats_data["session"]["compressions"]
+            daily_usd   = stats_data["session"].get("usd_saved", 0.0)
+            daily_total = f"{daily_saved:,} [{daily_count}×]"
+        else:
+            daily_total = f"{tokens_saved:,} [1×]"
+            daily_usd   = usd_saved
+    else:
+        daily_total = f"{tokens_saved:,} [1×]"
+        daily_usd   = usd_saved
+
+    # ── Desktop macOS notification ─────────────────────────────────────────────
+    if not is_terminal:
+        _macos_notify(hint_label or source, ratio, savings_pct, daily_total)
+
+    # ── Terminal / desktop stderr output ───────────────────────────────────────
+    preview = compressed[:400] + ("…" if len(compressed) > 400 else "")
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from daemon.dashboard import render_hook_stats
+        sys.stderr.write(render_hook_stats(
+            ratio, savings_pct, filler_count, source,
+            daily_total, hint_label, preview,
+        ))
+    except Exception:
+        pass
+
+    # ── Hook output ────────────────────────────────────────────────────────────
+    # Plain-text stats — no markdown tables, renders cleanly in terminal
+    _TIER_EMOJI = {"SIMPLE": "🟢", "MEDIUM": "🟡", "COMPLEX": "🟠", "REASONING": "🔴"}
+    tier_line = f"{_TIER_EMOJI.get(tier, '⚪')} {tier}"
+    if recommended:
+        short_model = recommended.replace("claude-", "").replace("-2024", "")
+        tier_line += f"  →  {short_model}"
+    rows = [
         ("Tokens saved",   f"{savings_pct}%  ({daily_total} today)"),
         ("Compression",    f"{ratio:.1f}×"),
         ("Filler removed", f"{filler_count} phrases"),
         ("Engine",         source),
+        ("USD saved",      f"${usd_saved:.4f}  (${daily_usd:.4f} today)"),
+        ("Intent",         tier_line),
     ]
-    if hint:
-        md_rows.append(("Model hint", hint))
-    table = "| | |\n|---|---|\n"
-    table += "\n".join(f"| **{label}** | {val} |" for label, val in md_rows)
+    if hint_label:
+        rows.append(("💡 Nudge", hint_label))
+
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from daemon.tips import get_tip
+        tip = get_tip(tier, seed=session_id)
+    except Exception:
+        tip = ""
+
+    col_w = max(len(r[0]) for r in rows)
+    stats_lines = "\n".join(f"  {label:<{col_w}}  {val}" for label, val in rows)
+    preview_txt = compressed[:300] + ("..." if len(compressed) > 300 else "")
     system_msg = (
-        f"**Switchboard** · {source} · {ratio:.1f}× compressed\n\n"
-        + table
-        + f"\n\n**Prompt sent to Claude:**\n*{preview}*"
+        f"⚡ Switchboard v2  |  {source}  |  {ratio:.1f}x compressed\n"
+        f"{'─' * 48}\n"
+        + stats_lines
+        + f"\n{'─' * 48}\n"
+        f"Prompt: {preview_txt}"
+        + (f"\n{'─' * 48}\n💬 Tip: {tip}" if tip else "")
     )
 
-    # Only include userMessage when text actually changed — when it equals the
-    # original Claude Code treats the hook as a no-op and skips systemMessage.
-    out: dict = {"additionalContext": advisory, "systemMessage": system_msg}
-    if compressed != prompt:
-        out["userMessage"] = compressed
+    user_msg_final = brevity_text + f"\n\n{compressed}"
 
-    sys.stdout.write(json.dumps(out))
+    sys.stdout.write(json.dumps({
+        "userMessage":   user_msg_final,
+        "systemMessage": system_msg,
+    }))
+
+
+# ── Hook: SessionStart ────────────────────────────────────────────────────────
+
+def run_session_start() -> None:
+    session_id = _session_id()
+    if _ensure_daemon():
+        _call("/session", {"action": "start", "session_id": session_id})
+        # Trigger opt-in daily rollup via daemon (daemon owns storage init)
+        _call("/rollup", timeout=6.0)
+    sys.stdout.write("{}")
+
+
+# ── Hook: Stop ────────────────────────────────────────────────────────────────
+
+def run_stop() -> None:
+    if _call("/health", timeout=0.5):
+        _call("/session", {"action": "end", "session_id": _session_id()})
+    sys.stdout.write("{}")
 
 
 # ── Daemon mode ───────────────────────────────────────────────────────────────
 
 def run_daemon() -> None:
-    import threading
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-
-    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-
-    from llmlingua import PromptCompressor
-
-    compressor = PromptCompressor(
-        model_name="microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank",
-        use_llmlingua2=True,
-        device_map="cpu",
-    )
-
-    last_request = [time.monotonic()]
-
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass  # suppress access log noise
-
-        def do_GET(self):
-            if self.path == "/health":
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"ok")
-
-        def do_POST(self):
-            if self.path != "/compress":
-                self.send_response(404)
-                self.end_headers()
-                return
-
-            last_request[0] = time.monotonic()
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
-            text: str = body.get("text", "")
-            ratio_target: float = float(body.get("ratio", 0.5))
-
-            try:
-                r = compressor.compress_prompt(text, rate=ratio_target, force_tokens=["\n"])
-                compressed = r["compressed_prompt"]
-                orig   = r.get("origin_tokens",     len(text)       // 4)
-                compr  = r.get("compressed_tokens", len(compressed) // 4)
-                ratio  = round(orig / max(compr, 1), 2)
-            except Exception:
-                compressed, ratio = text, 1.0
-
-            payload = json.dumps({"compressed": compressed, "ratio": ratio}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-
-    HOOK_DIR.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(str(os.getpid()))
-
-    def _idle_watcher():
-        while True:
-            time.sleep(60)
-            if time.monotonic() - last_request[0] > IDLE_SECS:
-                PID_FILE.unlink(missing_ok=True)
-                os._exit(0)
-
-    threading.Thread(target=_idle_watcher, daemon=True).start()
-
-    server = HTTPServer(("localhost", PORT), Handler)
-    server.serve_forever()
+    sys.path.insert(0, str(Path(__file__).parent))
+    from daemon.server import serve
+    serve(HOOK_DIR)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if "--serve" in sys.argv:
+    args = set(sys.argv[1:])
+    if "--serve" in args:
         run_daemon()
+    elif "--session-start" in args:
+        run_session_start()
+    elif "--stop" in args:
+        run_stop()
     else:
         run_hook()

@@ -1,14 +1,40 @@
 {
-  "UserPromptSubmit": [
-    {
-      "hooks": [
-        {
-          "type": "command",
-          "command": "\"${CLAUDE_PLUGIN_ROOT}/run.sh\"",
-          "timeout": 15,
-          "statusMessage": "Compressing prompt…"
-        }
-      ]
-    }
-  ]
+  "description": "Switchboard v2 — prompt compression, brevity modes, token dashboard",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/run.sh\"",
+            "timeout": 15,
+            "statusMessage": "Compressing prompt…"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/run.sh\" --session-start",
+            "timeout": 10,
+            "statusMessage": "Warming Switchboard…"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/run.sh\" --stop",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
 }

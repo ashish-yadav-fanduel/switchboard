@@ -1,6 +1,14 @@
 {
   "name": "switchboard",
-  "version": "1.0.0",
-  "description": "Prompt compressor for Claude Code. Strips filler words, scores sentences with TF-IDF, and shows a daily token-savings dashboard. Routes prompts to haiku/sonnet/opus via LiteLLM complexity scoring.",
-  "hooks": "../hooks/hooks.json"
+  "version": "2.0.0",
+  "description": "Switchboard v2 — caveman-inspired productivity plugin for FanDuel engineers. Compresses prompts, enforces output brevity (lite/full/ultra), tracks token + USD savings, nudges to cheaper models, and shrinks MCP tool descriptions. Works with Claude Code today; Cursor and ChatGPT adapters reuse the same local daemon.",
+  "hooks": "../hooks/hooks.json",
+  "commandsDirectory": "../commands",
+  "mcpServers": {
+    "switchboard-shrink": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/venv/bin/python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/shrink_server.py"],
+      "description": "Shrinks MCP tool descriptions via Switchboard daemon (30-50% reduction)"
+    }
+  }
 }
